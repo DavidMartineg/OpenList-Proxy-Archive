@@ -1,327 +1,264 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
-# ============================================================================
-# 配置区
-# ============================================================================
-GITHUB_URL="https://github.com/你的用户名/项目名/releases/latest/download/example.tar.gz"
-WORK_DIR="/root/.example_proxy"
-BINARY_NAME="example"
-ARCHIVE_NAME="example.tar.gz"
+# 颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# ============================================================================
-# 函数定义
-# ============================================================================
+error_exit() {
+    echo -e "${RED}错误: $1${NC}" >&2
+    exit 1
+}
 
-download_and_extract() {
-    echo "1. 下载二进制文件..."
-    
-    if command -v curl &> /dev/null; then
-        curl -L -o "$ARCHIVE_NAME" "$GITHUB_URL"
-    elif command -v wget &> /dev/null; then
-        wget -O "$ARCHIVE_NAME" "$GITHUB_URL"
+info() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
+# 检查 root 权限（安装服务需要）
+if [[ $EUID -ne 0 ]]; then
+   error_exit "此脚本需要 root 权限来安装系统服务，请使用 sudo 运行。"
+fi
+
+# 卸载功能
+if [[ "$1" == "uninstall" ]]; then
+    SERVICE_NAME="openlist-proxy"
+    # 停止并禁用服务
+    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+        systemctl stop "$SERVICE_NAME"
+        systemctl disable "$SERVICE_NAME"
+        rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+        systemctl daemon-reload
+        info "已删除 systemd 服务"
+    elif [[ -f /etc/init.d/${SERVICE_NAME} ]]; then
+        rc-service "$SERVICE_NAME" stop
+        rc-update del "$SERVICE_NAME"
+        rm -f "/etc/init.d/${SERVICE_NAME}"
+        info "已删除 OpenRC 服务"
+    fi
+
+    # 删除工作目录（假设脚本在 ~/ 下执行，工作目录为 ~/op）
+    WORKDIR="./op"
+    if [[ -d "$WORKDIR" ]]; then
+        rm -rf "$WORKDIR"
+        info "已删除工作目录: $WORKDIR"
     else
-        echo "错误: 需要 curl 或 wget"
-        exit 1
+        warn "工作目录不存在: $WORKDIR"
     fi
-    
-    if [[ ! -f "$ARCHIVE_NAME" ]]; then
-        echo "错误: 下载失败"
-        exit 1
-    fi
-    
-    echo "2. 解压文件..."
-    tar -xzvf "$ARCHIVE_NAME" "$BINARY_NAME" 2>/dev/null
-    
-    if [[ ! -f "$BINARY_NAME" ]]; then
-        echo "错误: 解压失败或文件不存在"
-        exit 1
-    fi
-    
-    rm -f "$ARCHIVE_NAME"
-    chmod +x "./$BINARY_NAME"
-}
+    info "卸载完成"
+    exit 0
+fi
 
-collect_parameters() {
-    echo "3. 配置参数..."
-    
-    # 必须参数：地址
-    while true; do
-        # 直接从终端读取，避免管道问题
-        read -p "请输入网盘地址 (必须): " address </dev/tty
-        
-        # 清理输入：去除前后空格和换行符
-        address=$(echo -n "$address" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ -n "$address" ]]; then
-            break
-        fi
-        echo "错误: 地址不能为空，请重新输入"
-    done
-    
-    # 必须参数：token
-    while true; do
-        read -p "请输入token (必须): " token </dev/tty
-        token=$(echo -n "$token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ -n "$token" ]]; then
-            break
-        fi
-        echo "错误: token不能为空"
-    done
-    
-    # 可选参数：端口
-    read -p "请输入监听端口 (默认: 5243): " user_port </dev/tty
-    user_port=$(echo -n "$user_port" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-    port="${user_port:-5243}"
-    
-    # 可选参数：HTTPS
-    read -p "是否启用HTTPS? (y/N): " use_https </dev/tty
-    use_https=$(echo -n "$use_https" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-    
-    if [[ "$use_https" == "y" || "$use_https" == "Y" ]]; then
-        https_enabled="true"
-        echo "4. 配置SSL证书..."
-        setup_ssl_certs
+# 创建工作目录并进入
+WORKDIR="./op"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+WORKDIR_ABS=$(pwd -P)
+info "工作目录: $WORKDIR_ABS"
+
+# 检测系统架构
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64|amd64) ARCH="amd64" ;;
+    *) error_exit "不支持的架构: $ARCH (仅支持 amd64)" ;;
+esac
+info "系统架构: $ARCH"
+
+# 检测发行版
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS_ID=$ID
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        INIT_SYSTEM="systemd"
+    elif [[ "$OS_ID" == "alpine" ]]; then
+        INIT_SYSTEM="openrc"
     else
-        https_enabled="false"
-        echo "4. 跳过SSL证书配置（HTTP模式）"
+        error_exit "不支持的发行版: $OS_ID (仅支持 Ubuntu/Debian/Alpine)"
     fi
-}
+else
+    error_exit "无法检测系统发行版"
+fi
+info "初始化系统: $INIT_SYSTEM"
 
-setup_ssl_certs() {
-    # 证书文件
-    if [[ -f "$HOME/server.crt" ]]; then
-        echo "找到 ~/server.crt"
-        read -p "是否使用此文件? (Y/n): " confirm </dev/tty
-        confirm=$(echo -n "$confirm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ "$confirm" != "n" && "$confirm" != "N" ]]; then
-            cp "$HOME/server.crt" "./server.crt"
-            echo "已复制证书到工作目录"
-        else
-            get_cert_path
-        fi
+# 下载链接
+DOWNLOAD_URL="https://raw.githubusercontent.com/DavidMartineg/OpenList-Proxy-Installer/main/openlist-proxy_Linux_${ARCH}.tar.gz"
+info "下载地址: $DOWNLOAD_URL"
+
+# 下载并解压
+TMP_FILE=$(mktemp)
+warn "正在下载..."
+curl -L -o "$TMP_FILE" "$DOWNLOAD_URL" || error_exit "下载失败"
+warn "正在解压..."
+tar -xzf "$TMP_FILE" || error_exit "解压失败"
+rm -f "$TMP_FILE"
+info "解压完成，已删除压缩包"
+
+# 确定二进制文件
+BIN_NAME="openlist-proxy"
+if [[ ! -f "./$BIN_NAME" ]]; then
+    # 尝试查找第一个可执行文件
+    FOUND_BIN=$(find . -maxdepth 1 -type f -executable | head -1)
+    if [[ -n "$FOUND_BIN" ]]; then
+        BIN_NAME=$(basename "$FOUND_BIN")
+        info "检测到二进制文件: $BIN_NAME"
     else
-        echo "未找到 ~/server.crt"
-        get_cert_path
+        error_exit "未找到可执行二进制文件"
     fi
-    
-    # 密钥文件
-    if [[ -f "$HOME/server.key" ]]; then
-        echo "找到 ~/server.key"
-        read -p "是否使用此文件? (Y/n): " confirm </dev/tty
-        confirm=$(echo -n "$confirm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ "$confirm" != "n" && "$confirm" != "N" ]]; then
-            cp "$HOME/server.key" "./server.key"
-            chmod 600 "./server.key"
-            echo "已复制密钥到工作目录"
-        else
-            get_key_path
-        fi
+else
+    chmod +x "./$BIN_NAME"
+fi
+BIN_ABS="$WORKDIR_ABS/$BIN_NAME"
+
+# ========== 交互式参数收集 ==========
+echo -e "\n${YELLOW}请按照提示配置启动参数:${NC}"
+
+# 1. address
+read -p "请输入 -address (完整的 URL，例如 https://example.com): " ADDRESS
+while [[ -z "$ADDRESS" ]]; do
+    warn "地址不能为空"
+    read -p "请输入 -address: " ADDRESS
+done
+
+# 2. HTTPS 选择
+HTTPS_ENABLED="false"
+CERT_FILE=""
+KEY_FILE=""
+read -p "是否启用 HTTPS? (Y/N，回车默认 N): " -n 1 -r HTTPS_CHOICE
+echo
+if [[ "$HTTPS_CHOICE" == "Y" || "$HTTPS_CHOICE" == "y" ]]; then
+    # 检查 ~/server.crt 和 ~/server.key
+    USER_HOME=$(eval echo ~$SUDO_USER)
+    CERT_CANDIDATE="$USER_HOME/server.crt"
+    KEY_CANDIDATE="$USER_HOME/server.key"
+    if [[ -f "$CERT_CANDIDATE" && -f "$KEY_CANDIDATE" ]]; then
+        HTTPS_ENABLED="true"
+        CERT_FILE="$CERT_CANDIDATE"
+        KEY_FILE="$KEY_CANDIDATE"
+        info "找到证书: $CERT_FILE"
+        info "找到密钥: $KEY_FILE"
     else
-        echo "未找到 ~/server.key"
-        get_key_path
+        warn "未找到 ~/server.crt 或 ~/server.key，将降级为 HTTP 模式"
+        HTTPS_ENABLED="false"
     fi
-}
+fi
 
-get_cert_path() {
-    while true; do
-        read -p "请输入证书文件路径: " cert_path </dev/tty
-        cert_path=$(echo -n "$cert_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ -f "$cert_path" ]]; then
-            cp "$cert_path" "./server.crt"
-            echo "已复制证书到工作目录"
-            break
-        else
-            echo "文件不存在: $cert_path"
-        fi
-    done
-}
+# 3. 端口
+read -p "请输入运行端口 (默认 5243，直接回车使用默认值): " PORT_INPUT
+if [[ -z "$PORT_INPUT" || "$PORT_INPUT" == "5243" ]]; then
+    PORT=""
+    info "使用默认端口 5243 (不添加 -port 参数)"
+else
+    PORT="$PORT_INPUT"
+    info "使用端口: $PORT"
+fi
 
-get_key_path() {
-    while true; do
-        read -p "请输入密钥文件路径: " key_path </dev/tty
-        key_path=$(echo -n "$key_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ -f "$key_path" ]]; then
-            cp "$key_path" "./server.key"
-            chmod 600 "./server.key"
-            echo "已复制密钥到工作目录"
-            break
-        else
-            echo "文件不存在: $key_path"
-        fi
-    done
-}
+# 4. token
+read -p "请输入 -token: " TOKEN
+while [[ -z "$TOKEN" ]]; do
+    warn "token 不能为空"
+    read -p "请输入 -token: " TOKEN
+done
 
-build_command() {
-    local args=()
-    
-    args+=("-address")
-    args+=("$address")
-    
-    if [[ "$https_enabled" == "true" ]]; then
-        args+=("-cert")
-        args+=("./server.crt")
-        args+=("-https")
-        args+=("true")
-        args+=("-key")
-        args+=("./server.key")
-    fi
-    
-    if [[ "$port" != "5243" ]]; then
-        args+=("-port")
-        args+=("$port")
-    fi
-    
-    args+=("-token")
-    args+=("$token")
-    
-    echo "${args[@]}"
-}
+# ========== 构建命令 ==========
+CMD="$BIN_ABS"
+CMD+=" -address \"$ADDRESS\""
 
-run_service() {
-    echo "5. 启动服务..."
-    cmd_args=$(build_command)
-    
-    echo "执行命令:"
-    echo "./$BINARY_NAME $cmd_args"
-    echo ""
-    
-    ./"$BINARY_NAME" $cmd_args
-}
+if [[ "$HTTPS_ENABLED" == "true" ]]; then
+    CMD+=" -cert \"$CERT_FILE\""
+    CMD+=" -https true"
+    CMD+=" -key \"$KEY_FILE\""
+fi
 
-create_systemd_service() {
-    echo ""
-    echo "=== 创建systemd服务（开机自启）==="
-    
-    # 构建ExecStart命令
-    local exec_cmd="$WORK_DIR/$BINARY_NAME"
-    exec_cmd="$exec_cmd -address \"$address\""
-    exec_cmd="$exec_cmd -token \"$token\""
-    
-    if [[ "$https_enabled" == "true" ]]; then
-        exec_cmd="$exec_cmd -cert $WORK_DIR/server.crt"
-        exec_cmd="$exec_cmd -https true"
-        exec_cmd="$exec_cmd -key $WORK_DIR/server.key"
-    fi
-    
-    if [[ "$port" != "5243" ]]; then
-        exec_cmd="$exec_cmd -port $port"
-    fi
-    
-    # 创建服务文件
-    sudo tee /etc/systemd/system/example-proxy.service > /dev/null << EOF
+if [[ -n "$PORT" ]]; then
+    CMD+=" -port $PORT"
+fi
+
+CMD+=" -token \"$TOKEN\""
+
+# ========== 确认命令 ==========
+echo -e "\n${YELLOW}生成的启动命令如下:${NC}"
+echo "$CMD"
+
+read -p "请确认命令是否正确? (Y/N，回车默认 Y): " -n 1 -r CONFIRM
+echo
+if [[ "$CONFIRM" == "N" || "$CONFIRM" == "n" ]]; then
+    warn "您选择了手动处理。"
+    warn "您可以使用以下命令手动启动（或在服务文件中配置）："
+    echo "$CMD"
+    warn "脚本将退出，不会安装服务。"
+    exit 0
+fi
+
+# ========== 安装为系统服务 ==========
+SERVICE_NAME="openlist-proxy"
+
+if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    info "创建 systemd 服务: $SERVICE_FILE"
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Example Proxy Service
+Description=OpenList Proxy Service
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$WORK_DIR
-ExecStart=/bin/bash -c "$exec_cmd"
-Restart=on-failure
-RestartSec=10
+WorkingDirectory=$WORKDIR_ABS
+ExecStart=$CMD
+Restart=always
+User=$SUDO_USER
+Group=$SUDO_USER
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable example-proxy.service
-    
-    echo "✅ systemd服务已创建"
-    echo "   启动: sudo systemctl start example-proxy"
-    echo "   停止: sudo systemctl stop example-proxy"
-    echo "   状态: sudo systemctl status example-proxy"
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
+    info "服务已启动，状态如下:"
+    systemctl status "$SERVICE_NAME" --no-pager
+
+elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
+    info "创建 OpenRC 服务: $SERVICE_FILE"
+    cat > "$SERVICE_FILE" <<EOF
+#!/sbin/openrc-run
+
+name="OpenList Proxy"
+description="OpenList Proxy Service"
+command="$BIN_ABS"
+command_args="-address \"$ADDRESS\""
+command_user="$SUDO_USER"
+pidfile="/run/${SERVICE_NAME}.pid"
+command_background=true
+
+depend() {
+    need net
 }
 
-create_shortcut() {
-    echo ""
-    echo "=== 创建快捷命令 ==="
-    
-    # 创建/usr/local/bin下的脚本
-    sudo tee /usr/local/bin/example-proxy > /dev/null << EOF
-#!/bin/bash
-WORK_DIR="$WORK_DIR"
-cd "\$WORK_DIR" || exit 1
-exec "\$WORK_DIR/$BINARY_NAME" "\$@"
+start_pre() {
+    # 根据 HTTPS 情况添加额外参数
+    if [[ "$HTTPS_ENABLED" == "true" ]]; then
+        command_args="\$command_args -cert \"$CERT_FILE\" -https true -key \"$KEY_FILE\""
+    fi
+    if [[ -n "$PORT" ]]; then
+        command_args="\$command_args -port $PORT"
+    fi
+    command_args="\$command_args -token \"$TOKEN\""
+    return 0
+}
 EOF
-
-    sudo chmod +x /usr/local/bin/example-proxy
-    echo "✅ 快捷命令已创建"
-    echo "   使用: example-proxy"
-}
-
-# ============================================================================
-# 主程序
-# ============================================================================
-main() {
-    echo "开始安装网盘代理服务"
-    echo "========================================"
-    
-    mkdir -p "$WORK_DIR"
-    cd "$WORK_DIR" || {
-        echo "错误: 无法进入工作目录 $WORK_DIR"
-        exit 1
-    }
-    
-    echo "工作目录: $WORK_DIR"
-    echo ""
-    
-    download_and_extract
-    echo ""
-    
-    collect_parameters
-    echo ""
-    
-    # 显示配置摘要
-    echo "配置摘要:"
-    echo "  网盘地址: $address"
-    echo "  Token: ${token:0:4}******"
-    echo "  端口: $port"
-    echo "  HTTPS: $([ "$https_enabled" == "true" ] && echo "启用" || echo "禁用")"
-    if [[ "$https_enabled" == "true" ]]; then
-        echo "  证书: $WORK_DIR/server.crt"
-        echo "  密钥: $WORK_DIR/server.key"
-    fi
-    
-    echo ""
-    read -p "是否立即启动服务? (Y/n): " confirm </dev/tty
-    confirm=$(echo -n "$confirm" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-    
-    if [[ "$confirm" != "n" && "$confirm" != "N" ]]; then
-        run_service
-        
-        # 创建快捷命令（总是创建）
-        create_shortcut
-        
-        # 询问是否创建服务
-        echo ""
-        read -p "是否创建开机自启服务? (y/N): " create_service </dev/tty
-        create_service=$(echo -n "$create_service" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n\r')
-        
-        if [[ "$create_service" == "y" || "$create_service" == "Y" ]]; then
-            create_systemd_service
-        fi
-        
-        echo ""
-        echo "安装完成！"
-    else
-        echo "已取消"
-        exit 0
-    fi
-}
-
-# ============================================================================
-# 脚本入口
-# ============================================================================
-if [[ $EUID -ne 0 ]]; then
-    echo "错误: 此脚本需要以root用户运行"
-    echo "请使用: sudo $0"
-    exit 1
+    chmod +x "$SERVICE_FILE"
+    rc-update add "$SERVICE_NAME" default
+    rc-service "$SERVICE_NAME" start
+    info "服务已启动，状态如下:"
+    rc-service "$SERVICE_NAME" status
 fi
 
-main
+info "安装完成！"
+info "如需卸载，请使用: $0 uninstall"
